@@ -1,11 +1,15 @@
-{% macro get_partition_batches(sql) -%}
+{% macro get_partition_batches(sql, as_subquery=True) -%}
     {%- set partitioned_by = config.get('partitioned_by') -%}
     {%- set athena_partitions_limit = config.get('partitions_limit', 100) | int -%}
     {%- set partitioned_keys = adapter.format_partition_keys(partitioned_by) -%}
     {% do log('PARTITIONED KEYS: ' ~ partitioned_keys) %}
 
     {% call statement('get_partitions', fetch_result=True) %}
-        select distinct {{ partitioned_keys }} from ({{ sql }}) order by {{ partitioned_keys }};
+        {%- if as_subquery -%}
+            select distinct {{ partitioned_keys }} from ({{ sql }}) order by {{ partitioned_keys }};
+        {%- else -%}
+            select distinct {{ partitioned_keys }} from {{ sql }} order by {{ partitioned_keys }};
+        {%- endif -%}
     {% endcall %}
 
     {%- set table = load_result('get_partitions').table -%}
@@ -24,7 +28,7 @@
             {%- if col is none -%}
                 {%- set value = 'null' -%}
                 {%- set comp_func = ' is ' -%}
-            {%- elif column_type == 'integer' -%}
+            {%- elif column_type == 'integer' or column_type is none -%}
                 {%- set value = col | string -%}
             {%- elif column_type == 'string' -%}
                 {%- set value = "'" + col + "'" -%}

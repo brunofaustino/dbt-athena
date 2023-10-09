@@ -47,7 +47,18 @@
     {{ "," if not is_last }}
 {%- endmacro -%}
 
-{% macro iceberg_merge(on_schema_change, tmp_relation, target_relation, unique_key, incremental_predicates, existing_relation, delete_condition, statement_name="main") %}
+{% macro iceberg_merge(
+    on_schema_change,
+    tmp_relation,
+    target_relation,
+    unique_key,
+    incremental_predicates,
+    existing_relation,
+    delete_condition,
+    update_condition,
+    statement_name="main"
+  )
+%}
     {%- set merge_update_columns = config.get('merge_update_columns') -%}
     {%- set merge_exclude_columns = config.get('merge_exclude_columns') -%}
     {%- set merge_update_columns_default_rule = config.get('merge_update_columns_default_rule', 'replace') -%}
@@ -96,15 +107,17 @@
           when matched and ({{ delete_condition }})
           then delete
       {%- endif %}
-      when matched
-        then update set
-          {%- for col in update_columns %}
-            {%- if merge_update_columns_rules and col.name in merge_update_columns_rules %}
-              {{ get_update_statement(col, merge_update_columns_rules[col.name], loop.last) }}
-            {%- else -%}
-              {{ get_update_statement(col, merge_update_columns_default_rule, loop.last) }}
-            {%- endif -%}
-          {%- endfor %}
+      {% if update_columns -%}
+        when matched {% if update_condition is not none -%} and {{ update_condition }} {%- endif %}
+          then update set
+            {%- for col in update_columns %}
+              {%- if merge_update_columns_rules and col.name in merge_update_columns_rules %}
+                {{ get_update_statement(col, merge_update_columns_rules[col.name], loop.last) }}
+              {%- else -%}
+                {{ get_update_statement(col, merge_update_columns_default_rule, loop.last) }}
+              {%- endif -%}
+            {%- endfor %}
+      {%- endif %}
       when not matched
         then insert ({{ dest_cols_csv }})
          values ({{ src_cols_csv }})

@@ -6,6 +6,10 @@ import re
 
 import pytest
 
+from dbt.contracts.results import RunStatus
+from dbt.tests.adapter.incremental.test_incremental_merge_exclude_columns import (
+    BaseMergeExcludeColumns,
+)
 from dbt.tests.adapter.incremental.test_incremental_predicates import (
     BaseIncrementalPredicates,
 )
@@ -27,6 +31,7 @@ from dbt.tests.adapter.incremental.test_incremental_unique_id import (
     seeds__duplicate_insert_sql,
     seeds__seed_csv,
 )
+from dbt.tests.util import check_relations_equal, run_dbt
 
 seeds__expected_incremental_predicates_csv = """id,msg,color
 3,anyway,purple
@@ -44,6 +49,79 @@ seeds__expected_predicates_and_delete_condition_csv = """id,msg,color
 1,hey,blue
 1,hello,blue
 3,anyway,purple
+"""
+
+models__merge_exclude_all_columns_sql = """
+{{ config(
+    materialized = 'incremental',
+    unique_key = 'id',
+    incremental_strategy='merge',
+    merge_exclude_columns=['msg', 'color']
+) }}
+
+{% if not is_incremental() %}
+
+-- data for first invocation of model
+
+select 1 as id, 'hello' as msg, 'blue' as color
+union all
+select 2 as id, 'goodbye' as msg, 'red' as color
+
+{% else %}
+
+-- data for subsequent incremental update
+
+select 1 as id, 'hey' as msg, 'blue' as color
+union all
+select 2 as id, 'yo' as msg, 'green' as color
+union all
+select 3 as id, 'anyway' as msg, 'purple' as color
+
+{% endif %}
+"""
+
+seeds__expected_merge_exclude_all_columns_csv = """id,msg,color
+1,hello,blue
+2,goodbye,red
+3,anyway,purple
+"""
+
+models__update_condition_sql = """
+{{ config(
+        table_type='iceberg',
+        materialized='incremental',
+        incremental_strategy='merge',
+        unique_key=['id'],
+        update_condition='target.id > 1'
+    )
+}}
+
+{% if is_incremental() %}
+
+select * from (
+    values
+    (1, 'v1-updated')
+    , (2, 'v2-updated')
+) as t (id, value)
+
+{% else %}
+
+select * from (
+    values
+    (-1, 'v-1')
+    , (0, 'v0')
+    , (1, 'v1')
+    , (2, 'v2')
+) as t (id, value)
+
+{% endif %}
+"""
+
+seeds__expected_update_condition_csv = """id,value
+-1,v-1
+0,v0
+1,v1
+2,v2-updated
 """
 
 
@@ -183,6 +261,63 @@ class TestIcebergPredicatesAndDeleteCondition(BaseIncrementalPredicates):
             update_sql_file=None,
         )
         self.check_scenario_correctness(expected_fields, test_case_fields, project)
+
+
+class TestIcebergMergeExcludeColumns(BaseMergeExcludeColumns):
+    @pytest.fixture(scope="class")
+    def project_config_update(self):
+        return {
+            "models": {
+                "+incremental_strategy": "merge",
+                "+table_type": "iceberg",
+            }
+        }
+
+
+class TestIcebergMergeExcludeAllColumns(BaseMergeExcludeColumns):
+    @pytest.fixture(scope="class")
+    def project_config_update(self):
+        return {
+            "models": {
+                "+incremental_strategy": "merge",
+                "+table_type": "iceberg",
+            }
+        }
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {"merge_exclude_columns.sql": models__merge_exclude_all_columns_sql}
+
+    @pytest.fixture(scope="class")
+    def seeds(self):
+        return {"expected_merge_exclude_columns.csv": seeds__expected_merge_exclude_all_columns_csv}
+
+
+class TestIcebergUpdateCondition:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {"merge_update_condition.sql": models__update_condition_sql}
+
+    @pytest.fixture(scope="class")
+    def seeds(self):
+        return {"expected_merge_update_condition.csv": seeds__expected_update_condition_csv}
+
+    def test__merge_update_condition(self, project):
+        """Seed should match the model after incremental run"""
+
+        expected_seed_name = "expected_merge_update_condition"
+        run_dbt(["seed", "--select", expected_seed_name, "--full-refresh"])
+
+        relation_name = "merge_update_condition"
+        model_run = run_dbt(["run", "--select", relation_name])
+        model_run_result = model_run.results[0]
+        assert model_run_result.status == RunStatus.Success
+
+        model_update = run_dbt(["run", "--select", relation_name])
+        model_update_result = model_update.results[0]
+        assert model_update_result.status == RunStatus.Success
+
+        check_relations_equal(project.adapter, [relation_name, expected_seed_name])
 
 
 def replace_cast_date(model: str) -> str:

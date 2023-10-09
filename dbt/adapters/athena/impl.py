@@ -3,6 +3,7 @@ import os
 import posixpath as path
 import re
 import tempfile
+from dataclasses import dataclass
 from itertools import chain
 from textwrap import dedent
 from threading import Lock
@@ -52,6 +53,7 @@ from dbt.adapters.athena.utils import (
     get_chunks,
 )
 from dbt.adapters.base import ConstraintSupport, available
+from dbt.adapters.base.impl import AdapterConfig
 from dbt.adapters.base.relation import BaseRelation, InformationSchema
 from dbt.adapters.sql import SQLAdapter
 from dbt.contracts.graph.manifest import Manifest
@@ -61,12 +63,58 @@ from dbt.exceptions import DbtRuntimeError
 boto3_client_lock = Lock()
 
 
+@dataclass
+class AthenaConfig(AdapterConfig):
+    """
+    Database and relation-level configs.
+
+    Args:
+        work_group: Identifier of Athena workgroup.
+        s3_staging_dir: S3 location to store Athena query results and metadata.
+        external_location: If set, the full S3 path in which the table will be saved.
+        partitioned_by: An array list of columns by which the table will be partitioned.
+        bucketed_by: An array list of columns to bucket data, ignored if using Iceberg.
+        bucket_count: The number of buckets for bucketing your data, ignored if using Iceberg.
+        table_type: The type of table, supports hive or iceberg.
+        ha: If the table should be built using the high-availability method.
+        format: The data format for the table. Supports ORC, PARQUET, AVRO, JSON, TEXTFILE.
+        write_compression: The compression type to use for any storage format
+            that allows compression to be specified.
+        field_delimiter: Custom field delimiter, for when format is set to TEXTFILE.
+        table_properties : Table properties to add to the table, valid for Iceberg only.
+        native_drop:  Relation drop operations will be performed with SQL, not direct Glue API calls.
+        seed_by_insert: default behaviour uploads seed data to S3.
+        lf_tags_config: AWS lakeformation tags to associate with the table and columns.
+        seed_s3_upload_args: Dictionary containing boto3 ExtraArgs when uploading to S3.
+        partitions_limit: Maximum numbers of partitions when batching.
+    """
+
+    work_group: Optional[str] = None
+    s3_staging_dir: Optional[str] = None
+    external_location: Optional[str] = None
+    partitioned_by: Optional[str] = None
+    bucketed_by: Optional[str] = None
+    bucket_count: Optional[str] = None
+    table_type: str = "hive"
+    ha: bool = False
+    format: str = "parquet"
+    write_compression: Optional[str] = None
+    field_delimiter: Optional[str] = None
+    table_properties: Optional[str] = None
+    native_drop: Optional[str] = None
+    seed_by_insert: bool = False
+    lf_tags_config: Optional[Dict[str, Any]] = None
+    seed_s3_upload_args: Optional[Dict[str, Any]] = None
+    partitions_limit: Optional[int] = None
+
+
 class AthenaAdapter(SQLAdapter):
     BATCH_CREATE_PARTITION_API_LIMIT = 100
     BATCH_DELETE_PARTITION_API_LIMIT = 25
 
     ConnectionManager = AthenaConnectionManager
     Relation = AthenaRelation
+    AdapterSpecificConfigs = AthenaConfig
 
     # There is no such concept as constraints in Athena
     CONSTRAINT_SUPPORT = {
@@ -160,19 +208,27 @@ class AthenaAdapter(SQLAdapter):
         else:
             return False
 
-    def _s3_table_prefix(self, s3_data_dir: Optional[str]) -> str:
+    def _s3_table_prefix(
+        self, s3_data_dir: Optional[str], s3_tmp_table_dir: Optional[str], is_temporary_table: bool
+    ) -> str:
         """
         Returns the root location for storing tables in S3.
         This is `s3_data_dir`, if set at the model level, the s3_data_dir of the connection if provided,
         and `s3_staging_dir/tables/` if nothing provided as data dir.
         We generate a value here even if `s3_data_dir` is not set,
         since creating a seed table requires a non-default location.
+
+        When `s3_tmp_table_dir` is set, we use that as the root location for temporary tables.
         """
         conn = self.connections.get_thread_connection()
         creds = conn.credentials
+
+        s3_tmp_table_dir = s3_tmp_table_dir or creds.s3_tmp_table_dir
+        if s3_tmp_table_dir and is_temporary_table:
+            return s3_tmp_table_dir
+
         if s3_data_dir is not None:
             return s3_data_dir
-
         return path.join(creds.s3_staging_dir, "tables")
 
     def _s3_data_naming(self, s3_data_naming: Optional[str]) -> S3DataNaming:
@@ -192,6 +248,7 @@ class AthenaAdapter(SQLAdapter):
         relation: AthenaRelation,
         s3_data_dir: Optional[str] = None,
         s3_data_naming: Optional[str] = None,
+        s3_tmp_table_dir: Optional[str] = None,
         external_location: Optional[str] = None,
         is_temporary_table: bool = False,
     ) -> str:
@@ -201,10 +258,9 @@ class AthenaAdapter(SQLAdapter):
         """
         if external_location and not is_temporary_table:
             return external_location.rstrip("/")
-
         s3_path_table_part = relation.s3_path_table_part or relation.identifier
         schema_name = relation.schema
-        table_prefix = self._s3_table_prefix(s3_data_dir)
+        table_prefix = self._s3_table_prefix(s3_data_dir, s3_tmp_table_dir, is_temporary_table)
 
         mapping = {
             S3DataNaming.UNIQUE: path.join(table_prefix, str(uuid4())),
@@ -295,11 +351,9 @@ class AthenaAdapter(SQLAdapter):
 
     @available
     def clean_up_table(self, relation: AthenaRelation) -> None:
-        table_location = self.get_glue_table_location(relation)
-
         # this check avoids issues for when the table location is an empty string
         # or when the table does not exist and table location is None
-        if table_location:
+        if table_location := self.get_glue_table_location(relation):
             self.delete_from_s3(table_location)
 
     @available
@@ -314,6 +368,7 @@ class AthenaAdapter(SQLAdapter):
         s3_data_dir: Optional[str] = None,
         s3_data_naming: Optional[str] = None,
         external_location: Optional[str] = None,
+        seed_s3_upload_args: Optional[Dict[str, Any]] = None,
     ) -> str:
         conn = self.connections.get_thread_connection()
         client = conn.handle
@@ -332,7 +387,7 @@ class AthenaAdapter(SQLAdapter):
             # This ensures cross-platform support, tempfile.NamedTemporaryFile does not
             tmpfile = os.path.join(tempfile.gettempdir(), os.urandom(24).hex())
             table.to_csv(tmpfile, quoting=csv.QUOTE_NONNUMERIC)
-            s3_client.upload_file(tmpfile, bucket, object_name)
+            s3_client.upload_file(tmpfile, bucket, object_name, ExtraArgs=seed_s3_upload_args)
             os.remove(tmpfile)
 
         return str(s3_location)
@@ -544,7 +599,6 @@ class AthenaAdapter(SQLAdapter):
     @available
     def list_relations_without_caching(self, schema_relation: AthenaRelation) -> List[BaseRelation]:
         data_catalog = self._get_data_catalog(schema_relation.database)
-        catalog_id = get_catalog_id(data_catalog)
         if data_catalog and data_catalog["Type"] != "GLUE":
             # For non-Glue Data Catalogs, use the original Athena query against INFORMATION_SCHEMA approach
             return super().list_relations_without_caching(schema_relation)  # type: ignore
@@ -559,7 +613,7 @@ class AthenaAdapter(SQLAdapter):
             "DatabaseName": schema_relation.schema,
         }
         # If the catalog is `awsdatacatalog` we don't need to pass CatalogId as boto3 infers it from the account Id.
-        if catalog_id:
+        if catalog_id := get_catalog_id(data_catalog):
             kwargs["CatalogId"] = catalog_id
         page_iterator = paginator.paginate(**kwargs)
 
@@ -735,6 +789,12 @@ class AthenaAdapter(SQLAdapter):
     ) -> None:
         """Save model/columns description to Glue Table metadata.
 
+        :param relation: Relation we are performing the docs persist
+        :param model: The dbt model definition as a dict
+        :param persist_relation_docs: Flag indicating whether we want to persist the model description as glue table
+            description
+        :param persist_column_docs: Flag indicating whether we want to persist column description as glue column
+            description
         :param skip_archive_table_version: if True, current table version will not be archived before creating new one.
             The purpose is to avoid creating redundant table version if it already was created during the same dbt run
             after CREATE OR REPLACE VIEW or ALTER TABLE statements.

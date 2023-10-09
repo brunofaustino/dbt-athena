@@ -56,11 +56,13 @@ class AthenaCredentials(Credentials):
     poll_interval: float = 1.0
     debug_query_state: bool = False
     _ALIASES = {"catalog": "database"}
-    num_retries: Optional[int] = 5
+    num_retries: int = 5
     s3_data_dir: Optional[str] = None
     s3_data_naming: Optional[str] = "schema_table_unique"
-    # Unfortunately we can not just use dict, must by Dict because we'll get the following error:
+    s3_tmp_table_dir: Optional[str] = None
+    # Unfortunately we can not just use dict, must be Dict because we'll get the following error:
     # Credentials in profile "athena", target "athena" invalid: Unable to create schema for 'dict'
+    seed_s3_upload_args: Optional[Dict[str, Any]] = None
     lf_tags_database: Optional[Dict[str, str]] = None
 
     @property
@@ -85,7 +87,9 @@ class AthenaCredentials(Credentials):
             "endpoint_url",
             "s3_data_dir",
             "s3_data_naming",
+            "s3_tmp_table_dir",
             "debug_query_state",
+            "seed_s3_upload_args",
             "lf_tags_database",
         )
 
@@ -126,10 +130,10 @@ class AthenaCursor(Cursor):
                 AthenaQueryExecution.STATE_CANCELLED,
             ]:
                 return query_execution
-            else:
-                if self.connection.cursor_kwargs.get("debug_query_state", False):
-                    logger.debug(f"Query state is: {query_execution.state}. Sleeping for {self._poll_interval}...")
-                time.sleep(self._poll_interval)
+
+            if self.connection.cursor_kwargs.get("debug_query_state", False):
+                logger.debug(f"Query state is: {query_execution.state}. Sleeping for {self._poll_interval}...")
+            time.sleep(self._poll_interval)
 
     def execute(  # type: ignore
         self,
@@ -226,7 +230,7 @@ class AthenaConnectionManager(SQLConnectionManager):
                 poll_interval=creds.poll_interval,
                 session=get_boto3_session(connection),
                 retry_config=RetryConfig(
-                    attempt=creds.num_retries,
+                    attempt=creds.num_retries + 1,
                     exceptions=("ThrottlingException", "TooManyRequestsException", "InternalServerException"),
                 ),
                 config=get_boto3_config(),
